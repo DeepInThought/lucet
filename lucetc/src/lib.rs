@@ -1,203 +1,426 @@
-pub mod bindings;
-pub mod compiler;
-pub mod error;
-pub mod load;
-pub mod patch;
-pub mod program;
+#![deny(bare_trait_objects)]
 
-use crate::compiler::data::{compile_data_initializers, compile_sparse_page_data};
-use crate::compiler::function::compile_function;
-use crate::compiler::globals::compile_global_specs;
-use crate::compiler::memory::compile_memory_specs;
-use crate::compiler::module_data::compile_module_data;
-use crate::compiler::table::compile_table;
-use crate::error::{LucetcError, LucetcErrorKind};
-use crate::load::read_module;
-use crate::patch::patch_module;
-use crate::program::Program;
-use failure::{format_err, Error, ResultExt};
-use parity_wasm::elements::Module;
-use std::collections::HashMap;
+mod compiler;
+mod decls;
+mod error;
+mod function;
+mod function_manifest;
+mod heap;
+mod load;
+mod module;
+mod name;
+mod output;
+mod patch;
+mod pointer;
+mod runtime;
+pub mod signature;
+mod sparsedata;
+mod stack_probe;
+mod table;
+mod traps;
+mod types;
+
+use crate::load::read_bytes;
+pub use crate::{
+    compiler::{Compiler, CpuFeatures, OptLevel, SpecificFeature, TargetCpu},
+    error::Error,
+    heap::HeapSettings,
+    load::read_module,
+    patch::patch_module,
+};
+pub use lucet_module::bindings::Bindings;
+pub use lucet_validate::Validator;
+use signature::{PublicKey, SecretKey};
+use std::env;
 use std::path::{Path, PathBuf};
+use target_lexicon::Triple;
 use tempfile;
 
-pub use crate::{
-    bindings::Bindings,
-    compiler::{Compiler, OptLevel},
-    program::memory::HeapSettings,
-};
-
-pub struct Lucetc {
-    module: Module,
-    name: String,
-    bindings: Bindings,
-    opt_level: OptLevel,
-    heap: HeapSettings,
-    builtins_path: Option<PathBuf>,
+enum LucetcInput {
+    Bytes(Vec<u8>),
+    Path(PathBuf),
 }
 
-/*
-*/
+pub struct Lucetc {
+    input: LucetcInput,
+    bindings: Vec<Bindings>,
+    target: Triple,
+    opt_level: OptLevel,
+    cpu_features: CpuFeatures,
+    heap: HeapSettings,
+    builtins_paths: Vec<PathBuf>,
+    validator: Option<Validator>,
+    sk: Option<SecretKey>,
+    pk: Option<PublicKey>,
+    sign: bool,
+    verify: bool,
+    count_instructions: bool,
+}
+
+pub trait AsLucetc {
+    fn as_lucetc(&mut self) -> &mut Lucetc;
+}
+
+impl AsLucetc for Lucetc {
+    fn as_lucetc(&mut self) -> &mut Lucetc {
+        self
+    }
+}
+
+pub trait LucetcOpts {
+    fn bindings(&mut self, bindings: Bindings);
+    fn with_bindings(self, bindings: Bindings) -> Self;
+
+    fn target(&mut self, target: Triple);
+    fn with_target(self, target: Triple) -> Self;
+
+    fn opt_level(&mut self, opt_level: OptLevel);
+    fn with_opt_level(self, opt_level: OptLevel) -> Self;
+
+    fn cpu_features(&mut self, cpu_features: CpuFeatures);
+    fn with_cpu_features(self, cpu_features: CpuFeatures) -> Self;
+
+    fn builtins<P: AsRef<Path>>(&mut self, builtins_path: P);
+    fn with_builtins<P: AsRef<Path>>(self, builtins_path: P) -> Self;
+
+    fn validator(&mut self, validator: Validator);
+    fn with_validator(self, validator: Validator) -> Self;
+
+    fn min_reserved_size(&mut self, min_reserved_size: u64);
+    fn with_min_reserved_size(self, min_reserved_size: u64) -> Self;
+
+    fn max_reserved_size(&mut self, max_reserved_size: u64);
+    fn with_max_reserved_size(self, max_reserved_size: u64) -> Self;
+
+    /// Set the reserved size exactly.
+    ///
+    /// Equivalent to setting the minimum and maximum reserved sizes to the same value.
+    fn reserved_size(&mut self, reserved_size: u64);
+    /// Set the reserved size exactly.
+    ///
+    /// Equivalent to setting the minimum and maximum reserved sizes to the same value.
+    fn with_reserved_size(self, reserved_size: u64) -> Self;
+
+    fn guard_size(&mut self, guard_size: u64);
+    fn with_guard_size(self, guard_size: u64) -> Self;
+
+    fn pk(&mut self, pk: PublicKey);
+    fn with_pk(self, pk: PublicKey) -> Self;
+    fn sk(&mut self, sk: SecretKey);
+    fn with_sk(self, sk: SecretKey) -> Self;
+    fn verify(&mut self);
+    fn with_verify(self) -> Self;
+    fn sign(&mut self);
+    fn with_sign(self) -> Self;
+    fn count_instructions(&mut self, enable_count: bool);
+    fn with_count_instructions(self, enable_count: bool) -> Self;
+}
+
+impl<T: AsLucetc> LucetcOpts for T {
+    fn bindings(&mut self, bindings: Bindings) {
+        self.as_lucetc().bindings.push(bindings);
+    }
+
+    fn with_bindings(mut self, bindings: Bindings) -> Self {
+        self.bindings(bindings);
+        self
+    }
+
+    fn target(&mut self, target: Triple) {
+        self.as_lucetc().target = target;
+    }
+
+    fn with_target(mut self, target: Triple) -> Self {
+        self.target(target);
+        self
+    }
+
+    fn opt_level(&mut self, opt_level: OptLevel) {
+        self.as_lucetc().opt_level = opt_level;
+    }
+
+    fn with_opt_level(mut self, opt_level: OptLevel) -> Self {
+        self.opt_level(opt_level);
+        self
+    }
+
+    fn cpu_features(&mut self, cpu_features: CpuFeatures) {
+        self.as_lucetc().cpu_features = cpu_features;
+    }
+
+    fn with_cpu_features(mut self, cpu_features: CpuFeatures) -> Self {
+        self.cpu_features(cpu_features);
+        self
+    }
+
+    fn builtins<P: AsRef<Path>>(&mut self, builtins_path: P) {
+        self.as_lucetc()
+            .builtins_paths
+            .push(builtins_path.as_ref().to_owned());
+    }
+
+    fn with_builtins<P: AsRef<Path>>(mut self, builtins_path: P) -> Self {
+        self.builtins(builtins_path);
+        self
+    }
+
+    fn validator(&mut self, validator: Validator) {
+        self.as_lucetc().validator = Some(validator);
+    }
+
+    fn with_validator(mut self, validator: Validator) -> Self {
+        self.validator(validator);
+        self
+    }
+
+    fn min_reserved_size(&mut self, min_reserved_size: u64) {
+        self.as_lucetc().heap.min_reserved_size = min_reserved_size;
+    }
+
+    fn with_min_reserved_size(mut self, min_reserved_size: u64) -> Self {
+        self.min_reserved_size(min_reserved_size);
+        self
+    }
+
+    fn max_reserved_size(&mut self, max_reserved_size: u64) {
+        self.as_lucetc().heap.max_reserved_size = max_reserved_size;
+    }
+
+    fn with_max_reserved_size(mut self, max_reserved_size: u64) -> Self {
+        self.max_reserved_size(max_reserved_size);
+        self
+    }
+
+    fn reserved_size(&mut self, reserved_size: u64) {
+        self.as_lucetc().heap.min_reserved_size = reserved_size;
+        self.as_lucetc().heap.max_reserved_size = reserved_size;
+    }
+
+    fn with_reserved_size(mut self, reserved_size: u64) -> Self {
+        self.reserved_size(reserved_size);
+        self
+    }
+
+    fn guard_size(&mut self, guard_size: u64) {
+        self.as_lucetc().heap.guard_size = guard_size;
+    }
+
+    fn with_guard_size(mut self, guard_size: u64) -> Self {
+        self.guard_size(guard_size);
+        self
+    }
+
+    fn pk(&mut self, pk: PublicKey) {
+        self.as_lucetc().pk = Some(pk);
+    }
+
+    fn with_pk(mut self, pk: PublicKey) -> Self {
+        self.pk(pk);
+        self
+    }
+
+    fn sk(&mut self, sk: SecretKey) {
+        self.as_lucetc().sk = Some(sk);
+    }
+
+    fn with_sk(mut self, sk: SecretKey) -> Self {
+        self.sk(sk);
+        self
+    }
+
+    fn verify(&mut self) {
+        self.as_lucetc().verify = true;
+    }
+
+    fn with_verify(mut self) -> Self {
+        self.verify();
+        self
+    }
+
+    fn sign(&mut self) {
+        self.as_lucetc().sign = true;
+    }
+
+    fn with_sign(mut self) -> Self {
+        self.sign();
+        self
+    }
+
+    fn count_instructions(&mut self, count_instructions: bool) {
+        self.as_lucetc().count_instructions = count_instructions;
+    }
+
+    fn with_count_instructions(mut self, count_instructions: bool) -> Self {
+        self.count_instructions(count_instructions);
+        self
+    }
+}
 
 impl Lucetc {
-    pub fn new<P: AsRef<Path>>(input: P) -> Result<Self, LucetcError> {
+    pub fn new<P: AsRef<Path>>(input: P) -> Self {
         let input = input.as_ref();
-        let module = read_module(input)?;
-        let name = String::from(
-            input
-                .file_stem()
-                .ok_or(format_err!("input filename {:?} is not a file", input))?
-                .to_str()
-                .ok_or(format_err!("input filename {:?} is not valid utf8", input))?,
-        );
-        Ok(Self {
-            module,
-            name,
-            bindings: Bindings::empty(),
+        Self {
+            input: LucetcInput::Path(input.to_owned()),
+            bindings: vec![],
+            target: Triple::host(),
             opt_level: OptLevel::default(),
+            cpu_features: CpuFeatures::default(),
             heap: HeapSettings::default(),
-            builtins_path: None,
+            builtins_paths: vec![],
+            validator: None,
+            pk: None,
+            sk: None,
+            sign: false,
+            verify: false,
+            count_instructions: false,
+        }
+    }
+
+    pub fn try_from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self, Error> {
+        let input = read_bytes(bytes.as_ref().to_vec())?;
+        Ok(Self {
+            input: LucetcInput::Bytes(input),
+            bindings: vec![],
+            target: Triple::host(),
+            opt_level: OptLevel::default(),
+            cpu_features: CpuFeatures::default(),
+            heap: HeapSettings::default(),
+            builtins_paths: vec![],
+            validator: None,
+            pk: None,
+            sk: None,
+            sign: false,
+            verify: false,
+            count_instructions: false,
         })
     }
 
-    pub fn bindings(mut self, bindings: Bindings) -> Result<Self, Error> {
-        self.with_bindings(bindings)?;
-        Ok(self)
-    }
-    pub fn with_bindings(&mut self, bindings: Bindings) -> Result<(), Error> {
-        self.bindings.extend(bindings)
-    }
+    fn build(&self) -> Result<(Vec<u8>, Bindings), Error> {
+        use parity_wasm::elements::{deserialize_buffer, serialize};
 
-    pub fn opt_level(mut self, opt_level: OptLevel) -> Self {
-        self.with_opt_level(opt_level);
-        self
-    }
-    pub fn with_opt_level(&mut self, opt_level: OptLevel) {
-        self.opt_level = opt_level;
-    }
-
-    pub fn builtins<P: AsRef<Path>>(mut self, builtins: P) -> Result<Self, Error> {
-        self.with_builtins(builtins)?;
-        Ok(self)
-    }
-    pub fn with_builtins<P: AsRef<Path>>(&mut self, builtins_path: P) -> Result<(), Error> {
-        let (newmodule, builtins_map) = patch_module(self.module.clone(), builtins_path)?;
-        self.module = newmodule;
-        self.bindings.extend(Bindings::env(builtins_map))?;
-        Ok(())
-    }
-
-    pub fn min_reserved_size(mut self, min_reserved_size: u64) -> Self {
-        self.with_min_reserved_size(min_reserved_size);
-        self
-    }
-    pub fn with_min_reserved_size(&mut self, min_reserved_size: u64) {
-        self.heap.min_reserved_size = min_reserved_size;
-    }
-
-    pub fn max_reserved_size(mut self, max_reserved_size: u64) -> Self {
-        self.with_max_reserved_size(max_reserved_size);
-        self
-    }
-    pub fn with_max_reserved_size(&mut self, max_reserved_size: u64) {
-        self.heap.max_reserved_size = max_reserved_size;
-    }
-
-    pub fn guard_size(mut self, guard_size: u64) -> Self {
-        self.with_guard_size(guard_size);
-        self
-    }
-    pub fn with_guard_size(&mut self, guard_size: u64) {
-        self.heap.guard_size = guard_size;
-    }
-
-    pub fn object_file<P: AsRef<Path>>(self, output: P) -> Result<(), Error> {
-        let prog = Program::new(self.module, self.bindings, self.heap.clone())?;
-        let comp = compile(&prog, &self.name, self.opt_level)?;
-
-        let obj = comp.codegen()?;
-        obj.write(output.as_ref()).context("writing object file")?;
-
-        Ok(())
-    }
-
-    pub fn clif_ir<P: AsRef<Path>>(self, output: P) -> Result<(), Error> {
-        let (module, builtins_map) = if let Some(ref builtins_path) = self.builtins_path {
-            patch_module(self.module, builtins_path)?
-        } else {
-            (self.module, HashMap::new())
+        let mut builtins_bindings = vec![];
+        let mut module_binary = match &self.input {
+            LucetcInput::Bytes(bytes) => bytes.clone(),
+            LucetcInput::Path(path) => read_module(&path, &self.pk, self.verify)?,
         };
 
-        let mut bindings = self.bindings.clone();
-        bindings.extend(Bindings::env(builtins_map))?;
+        if !self.builtins_paths.is_empty() {
+            let mut module = deserialize_buffer(&module_binary)?;
+            for builtins in self.builtins_paths.iter() {
+                let (newmodule, builtins_map) = patch_module(module, builtins)?;
+                module = newmodule;
+                builtins_bindings.push(Bindings::env(builtins_map));
+            }
+            module_binary = serialize(module)?;
+        }
 
-        let prog = Program::new(module, bindings, self.heap.clone())?;
-        let comp = compile(&prog, &self.name, self.opt_level)?;
+        let mut bindings = Bindings::empty();
 
-        comp.cranelift_funcs()
-            .write(&output)
-            .context("writing clif file")?;
+        for binding in builtins_bindings.iter().chain(self.bindings.iter()) {
+            bindings.extend(binding)?;
+        }
+
+        Ok((module_binary, bindings))
+    }
+
+    pub fn object_file<P: AsRef<Path>>(&self, output: P) -> Result<(), Error> {
+        let (module_contents, bindings) = self.build()?;
+
+        let compiler = Compiler::new(
+            &module_contents,
+            self.target.clone(),
+            self.opt_level,
+            self.cpu_features.clone(),
+            &bindings,
+            self.heap.clone(),
+            self.count_instructions,
+            &self.validator,
+        )?;
+        let obj = compiler.object_file()?;
+        obj.write(output.as_ref())?;
 
         Ok(())
     }
 
-    pub fn shared_object_file<P: AsRef<Path>>(self, output: P) -> Result<(), Error> {
+    pub fn clif_ir<P: AsRef<Path>>(&self, output: P) -> Result<(), Error> {
+        let (module_contents, bindings) = self.build()?;
+
+        let compiler = Compiler::new(
+            &module_contents,
+            self.target.clone(),
+            self.opt_level,
+            self.cpu_features.clone(),
+            &bindings,
+            self.heap.clone(),
+            self.count_instructions,
+            &self.validator,
+        )?;
+
+        compiler.cranelift_funcs()?.write(&output)?;
+
+        Ok(())
+    }
+
+    pub fn shared_object_file<P: AsRef<Path>>(&self, output: P) -> Result<(), Error> {
         let dir = tempfile::Builder::new().prefix("lucetc").tempdir()?;
         let objpath = dir.path().join("tmp.o");
         self.object_file(objpath.clone())?;
-        link_so(objpath, output)?;
+        link_so(objpath, &self.target, &output)?;
+        if self.sign {
+            let sk = self.sk.as_ref().ok_or(Error::Signature(
+                "signing requires a secret key".to_string(),
+            ))?;
+            signature::sign_module(&output, sk)?;
+        }
         Ok(())
     }
 }
 
-fn link_so<P, Q>(objpath: P, sopath: Q) -> Result<(), Error>
+const LD_DEFAULT: &str = "ld";
+
+fn link_so<P, Q>(objpath: P, target: &Triple, sopath: Q) -> Result<(), Error>
 where
     P: AsRef<Path>,
     Q: AsRef<Path>,
 {
     use std::process::Command;
-    let mut cmd_ld = Command::new("ld");
+    let mut cmd_ld = Command::new(env::var("LD").unwrap_or(LD_DEFAULT.into()));
     cmd_ld.arg(objpath.as_ref());
-    cmd_ld.arg("-shared");
+    let env_ldflags = env::var("LDFLAGS").unwrap_or_else(|_| ldflags_default(target));
+    for flag in env_ldflags.split_whitespace() {
+        cmd_ld.arg(flag);
+    }
     cmd_ld.arg("-o");
     cmd_ld.arg(sopath.as_ref());
 
-    let run_ld = cmd_ld
-        .output()
-        .context(format_err!("running ld on {:?}", objpath.as_ref()))?;
+    let run_ld = cmd_ld.output()?;
 
     if !run_ld.status.success() {
-        Err(format_err!(
+        let message = format!(
             "ld of {} failed: {}",
             objpath.as_ref().to_str().unwrap(),
             String::from_utf8_lossy(&run_ld.stderr)
-        ))?;
+        );
+        Err(Error::LdError(message))?;
     }
     Ok(())
 }
 
-pub fn compile<'p>(
-    program: &'p Program,
-    name: &str,
-    opt_level: OptLevel,
-) -> Result<Compiler<'p>, LucetcError> {
-    let mut compiler = Compiler::new(name.to_owned(), &program, opt_level)?;
+fn ldflags_default(target: &Triple) -> String {
+    use target_lexicon::OperatingSystem;
 
-    compile_data_initializers(&mut compiler).context(LucetcErrorKind::DataInitializers)?;
-    compile_sparse_page_data(&mut compiler).context(LucetcErrorKind::DataInitializers)?;
-    compile_memory_specs(&mut compiler).context(LucetcErrorKind::MemorySpecs)?;
-    compile_global_specs(&mut compiler).context(LucetcErrorKind::GlobalSpecs)?;
-    compile_module_data(&mut compiler).context(LucetcErrorKind::ModuleData)?;
+    match target.operating_system {
+        OperatingSystem::Linux => "-shared",
+        OperatingSystem::MacOSX { .. } => {
+            "-dylib -dead_strip -export_dynamic -undefined dynamic_lookup"
+        }
+        _ => panic!(
+            "Cannot determine default flags for {}.
 
-    for function in program.defined_functions() {
-        let body = program.function_body(&function);
-        compile_function(&mut compiler, &function, body)
-            .context(LucetcErrorKind::Function(function.symbol().to_owned()))?;
+Please define the LDFLAGS environment variable with the necessary command-line
+flags for generating shared libraries.",
+            Triple::host()
+        ),
     }
-    for table in program.tables() {
-        compile_table(&mut compiler, &table)
-            .context(LucetcErrorKind::Table(table.symbol().to_owned()))?;
-    }
-
-    Ok(compiler)
+    .into()
 }

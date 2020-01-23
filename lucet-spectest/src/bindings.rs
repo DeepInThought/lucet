@@ -1,5 +1,25 @@
-use lucetc::bindings::Bindings;
+use lucet_module::bindings::Bindings;
+use lucet_runtime::lucet_hostcall;
+use lucet_runtime::vmctx::Vmctx;
 use serde_json::json;
+
+#[lucet_hostcall]
+#[no_mangle]
+pub fn print(_vmctx: &mut Vmctx) {
+    println!("hello, world!");
+}
+
+#[lucet_hostcall]
+#[no_mangle]
+pub fn print_i32(_vmctx: &mut Vmctx, x: i32) {
+    println!("{}", x);
+}
+
+#[lucet_hostcall]
+#[no_mangle]
+pub fn print_f32(_vmctx: &mut Vmctx, x: i32) {
+    println!("{}", x);
+}
 
 pub fn spec_test_bindings() -> Bindings {
     let imports: serde_json::Value = json!({

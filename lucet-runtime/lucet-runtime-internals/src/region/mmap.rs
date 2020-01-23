@@ -3,17 +3,60 @@ use crate::embed_ctx::CtxMap;
 use crate::error::Error;
 use crate::instance::{new_instance_handle, Instance, InstanceHandle};
 use crate::module::Module;
-use crate::region::{Region, RegionInternal};
+use crate::region::{Region, RegionCreate, RegionInternal};
+#[cfg(not(target_os = "linux"))]
+use libc::memset;
 use libc::{c_void, SIGSTKSZ};
 use nix::sys::mman::{madvise, mmap, munmap, MapFlags, MmapAdvise, ProtFlags};
 use std::ptr;
 use std::sync::{Arc, Mutex, Weak};
 
-/// A [`Region`](trait.Region.html) backed by `mmap`.
+/// A [`Region`](../trait.Region.html) backed by `mmap`.
+///
+/// `MmapRegion` lays out memory for instances in a contiguous block,
+/// with an Instance's space reserved, followed by heap, stack, globals, and sigstack.
+///
+/// This results in an actual layout of an instance on an `MmapRegion`-produced `Slot` being:
+/// ```text
+/// 0x0000: +-----------------------+ <-- Instance
+/// 0x0000: |  .magic               |
+/// 0x0008: |  ...                  |
+/// 0x000X: |  ...                  |
+/// 0x0XXX: |  .alloc -> Alloc {    |
+/// 0x0XXX: |    .start    = 0x0000 |
+/// 0x0XXX: |    .heap     = 0x1000 |
+/// 0x0XXX: |    .stack    = 0xN000 |
+/// 0x0XXX: |    .globals  = 0xM000 |
+/// 0x0XXX: |    .sigstack = 0xS000 |
+/// 0x0XXX: |  }                    |
+/// 0x0XXX: |  ...                  |
+/// 0x0XXX: ~      ~padding~        ~
+/// 0x0XXX: |  ...                  |
+/// 0x0XXX: |  .globals    = 0xM000 | <-- InstanceRuntimeData
+/// 0x0XXX: |  .inst_count = 0x0000 |
+/// 0x1000: +-----------------------+ <-- Heap, and `lucet_vmctx`. One page into the allocation.
+/// 0x1XXX: |                       |
+/// 0xXXXX: ~  .......heap.......   ~ // heap size is governed by limits.heap_address_space_size
+/// 0xXXXX: |                       |
+/// 0xN000: +-----------------------| <-- Stack (at heap_start + limits.heap_address_space_size)
+/// 0xNXXX: --- stack guard page ----
+/// 0xNXXX: |                       |
+/// 0xXXXX: ~  .......stack......   ~ // stack size is governed by limits.stack_size
+/// 0xXXXX: |                       |
+/// 0xM000: +-----------------------| <-- Globals (at stack_start + limits.stack_size + PAGE_SIZE)
+/// 0xMXXX: |                       |
+/// 0xXXXX: ~  ......globals.....   ~
+/// 0xXXXX: |                       |
+/// 0xXXXX  --- global guard page ---
+/// 0xS000: +-----------------------| <-- Sigstack (at globals_start + globals_size + PAGE_SIZE)
+/// 0xSXXX: |  ......sigstack....   | // sigstack is SIGSTKSZ bytes
+/// 0xSXXX: +-----------------------|
+/// ```
 pub struct MmapRegion {
     capacity: usize,
     freelist: Mutex<Vec<Slot>>,
     limits: Limits,
+    min_heap_alignment: usize,
 }
 
 impl Region for MmapRegion {}
@@ -46,7 +89,7 @@ impl RegionInternal for MmapRegion {
             // make the sigstack read/writable
             (slot.sigstack, SIGSTKSZ),
         ]
-        .into_iter()
+        .iter()
         {
             // eprintln!("setting r/w {:p}[{:x}]", *ptr, len);
             unsafe { mprotect(*ptr, *len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)? };
@@ -89,15 +132,23 @@ impl RegionInternal for MmapRegion {
 
         // clear and disable access to the heap, stack, globals, and sigstack
         for (ptr, len) in [
-            (slot.heap, slot.limits.heap_address_space_size),
+            // We don't ever shrink the heap, so we only need to zero up until the accessible size
+            (slot.heap, alloc.heap_accessible_size),
             (slot.stack, slot.limits.stack_size),
             (slot.globals, slot.limits.globals_size),
             (slot.sigstack, SIGSTKSZ),
         ]
-        .into_iter()
+        .iter()
         {
             // eprintln!("setting none {:p}[{:x}]", *ptr, len);
             unsafe {
+                // MADV_DONTNEED is not guaranteed to clear pages on non-Linux systems
+                #[cfg(not(target_os = "linux"))]
+                {
+                    mprotect(*ptr, *len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                        .expect("mprotect succeeds during drop");
+                    memset(*ptr, 0, *len);
+                }
                 mprotect(*ptr, *len, ProtFlags::PROT_NONE).expect("mprotect succeeds during drop");
                 madvise(*ptr, *len, MmapAdvise::MADV_DONTNEED)
                     .expect("madvise succeeds during drop");
@@ -126,15 +177,29 @@ impl RegionInternal for MmapRegion {
             let heap_size = alloc.slot().limits.heap_address_space_size;
 
             unsafe {
+                // `mprotect()` and `madvise()` are sufficient to zero a page on Linux,
+                // but not necessarily on all POSIX operating systems, and on macOS in particular.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    mprotect(
+                        heap,
+                        alloc.heap_accessible_size,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    )?;
+                    memset(heap, 0, alloc.heap_accessible_size);
+                }
                 mprotect(heap, heap_size, ProtFlags::PROT_NONE)?;
                 madvise(heap, heap_size, MmapAdvise::MADV_DONTNEED)?;
             }
         }
 
-        let initial_size = module.heap_spec().initial_size as usize;
+        let initial_size = module
+            .heap_spec()
+            .map(|h| h.initial_size as usize)
+            .unwrap_or(0);
 
         // reset the heap to the initial size, and mprotect those pages appropriately
-        if alloc.heap_accessible_size != initial_size {
+        if initial_size > 0 {
             unsafe {
                 mprotect(
                     heap,
@@ -142,10 +207,9 @@ impl RegionInternal for MmapRegion {
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 )?
             };
-            alloc.heap_accessible_size = initial_size;
-            alloc.heap_inaccessible_size =
-                alloc.slot().limits.heap_address_space_size - initial_size;
         }
+        alloc.heap_accessible_size = initial_size;
+        alloc.heap_inaccessible_size = alloc.slot().limits.heap_address_space_size - initial_size;
 
         // Initialize the heap using the module sparse page data. There cannot be more pages in the
         // sparse page data than will fit in the initial heap size.
@@ -193,6 +257,14 @@ impl Drop for MmapRegion {
     }
 }
 
+impl RegionCreate for MmapRegion {
+    const TYPE_NAME: &'static str = "MmapRegion";
+
+    fn create(instance_capacity: usize, limits: &Limits) -> Result<Arc<Self>, Error> {
+        MmapRegion::create(instance_capacity, limits)
+    }
+}
+
 impl MmapRegion {
     /// Create a new `MmapRegion` that can support a given number instances, each subject to the
     /// same runtime limits.
@@ -210,6 +282,48 @@ impl MmapRegion {
             capacity: instance_capacity,
             freelist: Mutex::new(Vec::with_capacity(instance_capacity)),
             limits: limits.clone(),
+            min_heap_alignment: 0, // No constaints on heap alignment by default
+        });
+        {
+            let mut freelist = region.freelist.lock().unwrap();
+            for _ in 0..instance_capacity {
+                freelist.push(MmapRegion::create_slot(&region)?);
+            }
+        }
+
+        Ok(region)
+    }
+
+    /// Create a new `MmapRegion` that can support a given number instances, each subject to the
+    /// same runtime limits. Additionally, ensure that the heap is aligned at least to the
+    /// specified amount. heap_alignment must be a power of 2.
+    ///
+    /// The region is returned in an `Arc`, because any instances created from it carry a reference
+    /// back to the region.
+    pub fn create_aligned(
+        instance_capacity: usize,
+        limits: &Limits,
+        heap_alignment: usize,
+    ) -> Result<Arc<Self>, Error> {
+        assert!(
+            SIGSTKSZ % host_page_size() == 0,
+            "signal stack size is a multiple of host page size"
+        );
+        limits.validate()?;
+
+        let is_power_of_2 = (heap_alignment & (heap_alignment - 1)) == 0;
+
+        if !is_power_of_2 {
+            return Err(Error::InvalidArgument(
+                "heap_alignment must be a power of 2",
+            ));
+        }
+
+        let region = Arc::new(MmapRegion {
+            capacity: instance_capacity,
+            freelist: Mutex::new(Vec::with_capacity(instance_capacity)),
+            limits: limits.clone(),
+            min_heap_alignment: heap_alignment,
         });
         {
             let mut freelist = region.freelist.lock().unwrap();
@@ -223,15 +337,27 @@ impl MmapRegion {
 
     fn create_slot(region: &Arc<MmapRegion>) -> Result<Slot, Error> {
         // get the chunk of virtual memory that the `Slot` will manage
-        let mem = unsafe {
-            mmap(
-                ptr::null_mut(),
-                region.limits.total_memory_size(),
-                ProtFlags::PROT_NONE,
-                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
-                0,
-                0,
-            )?
+        let mem = if region.min_heap_alignment == 0 {
+            unsafe {
+                mmap(
+                    ptr::null_mut(),
+                    region.limits.total_memory_size(),
+                    ProtFlags::PROT_NONE,
+                    MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                    0,
+                    0,
+                )?
+            }
+        } else {
+            unsafe {
+                mmap_aligned(
+                    region.limits.total_memory_size(),
+                    ProtFlags::PROT_NONE,
+                    MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                    region.min_heap_alignment, // requested alignment
+                    instance_heap_offset(),    // offset that must be aligned
+                )?
+            }
         };
 
         // set the first part of the memory to read/write so that the `Instance` can be stored there
@@ -246,8 +372,8 @@ impl MmapRegion {
 
         // lay out the other sections in memory
         let heap = mem as usize + instance_heap_offset();
-        let stack = heap + region.limits.heap_address_space_size;
-        let globals = stack + region.limits.stack_size + host_page_size();
+        let stack = heap + region.limits.heap_address_space_size + host_page_size();
+        let globals = stack + region.limits.stack_size;
         let sigstack = globals + host_page_size();
 
         Ok(Slot {
@@ -272,7 +398,138 @@ impl MmapRegion {
     }
 }
 
+// Note alignment must be a power of 2
+// Offset must be a multiple of 4Kb (page size)
+unsafe fn mmap_aligned(
+    requested_length: usize,
+    prot: ProtFlags,
+    flags: MapFlags,
+    alignment: usize,
+    alignment_offset: usize,
+) -> Result<*mut c_void, Error> {
+    let addr = ptr::null_mut();
+    let fd = 0;
+    let offset = 0;
+
+    let padded_length = requested_length + alignment + alignment_offset;
+    let unaligned = mmap(addr, padded_length, prot, flags, fd, offset)? as usize;
+
+    // Round up the next address that has addr % alignment = 0
+    let aligned_nonoffset = (unaligned + (alignment - 1)) & !(alignment - 1);
+
+    // Currently offset 0 is aligned according to alignment
+    // Alignment needs to be enforced at the given offset
+    let aligned = if aligned_nonoffset - alignment_offset >= unaligned {
+        aligned_nonoffset - alignment_offset
+    } else {
+        aligned_nonoffset - alignment_offset + alignment
+    };
+
+    //Sanity check
+    if aligned < unaligned
+        || (aligned + (requested_length - 1)) > (unaligned + (padded_length - 1))
+        || (aligned + alignment_offset) % alignment != 0
+    {
+        // explicitly ignore failures now, as this is just a best-effort clean up after the last fail
+        let _ = munmap(unaligned as *mut c_void, padded_length);
+        return Err(Error::Unsupported("Could not align memory".to_string()));
+    }
+
+    {
+        let unused_front = aligned - unaligned;
+        if unused_front != 0 {
+            if munmap(unaligned as *mut c_void, unused_front).is_err() {
+                // explicitly ignore failures now, as this is just a best-effort clean up after the last fail
+                let _ = munmap(unaligned as *mut c_void, padded_length);
+                return Err(Error::Unsupported("Could not align memory".to_string()));
+            }
+        }
+    }
+
+    {
+        let unused_back = (unaligned + (padded_length - 1)) - (aligned + (requested_length - 1));
+        if unused_back != 0 {
+            if munmap((aligned + requested_length) as *mut c_void, unused_back).is_err() {
+                // explicitly ignore failures now, as this is just a best-effort clean up after the last fail
+                let _ = munmap(unaligned as *mut c_void, padded_length);
+                return Err(Error::Unsupported("Could not align memory".to_string()));
+            }
+        }
+    }
+
+    return Ok(aligned as *mut c_void);
+}
+
 // TODO: remove this once `nix` PR https://github.com/nix-rust/nix/pull/991 is merged
 unsafe fn mprotect(addr: *mut c_void, length: libc::size_t, prot: ProtFlags) -> nix::Result<()> {
     nix::errno::Errno::result(libc::mprotect(addr, length, prot.bits())).map(drop)
+}
+
+#[cfg(test)]
+mod tests2 {
+    use super::*;
+    use nix::sys::mman::{munmap, MapFlags, ProtFlags};
+
+    #[test]
+    fn test_aligned_mem() {
+        let kb: usize = 1024;
+        let mb: usize = 1024 * kb;
+
+        struct TestProps {
+            pub mem_size: usize,
+            pub mem_align: usize,
+            pub offset: usize,
+        };
+
+        let tests = vec![
+            TestProps {
+                mem_size: 1 * mb,
+                mem_align: 1 * mb,
+                offset: 0,
+            },
+            TestProps {
+                mem_size: 1 * mb,
+                mem_align: 2 * mb,
+                offset: 0,
+            },
+            TestProps {
+                mem_size: 32 * mb,
+                mem_align: 32 * mb,
+                offset: 0,
+            },
+            TestProps {
+                mem_size: 32 * mb,
+                mem_align: 32 * mb,
+                offset: 4 * kb,
+            },
+        ];
+
+        for test in tests {
+            let mem = unsafe {
+                mmap_aligned(
+                    test.mem_size,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                    test.mem_align,
+                    test.offset,
+                )
+                .unwrap()
+            };
+
+            // Check alignment
+            let actual_align = ((mem as usize) + test.offset) % test.mem_align;
+            assert_eq!(actual_align, 0);
+
+            // Make sure the memory is accessible
+            let mem_slice =
+                unsafe { std::slice::from_raw_parts_mut(mem as *mut u8, test.mem_size) };
+            for loc in mem_slice {
+                *loc = 1;
+            }
+
+            unsafe {
+                munmap(mem, test.mem_size).unwrap();
+            }
+        }
+    }
 }

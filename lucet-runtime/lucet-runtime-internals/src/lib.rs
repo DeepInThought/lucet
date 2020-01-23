@@ -6,6 +6,9 @@
 
 #[macro_use]
 pub mod error;
+#[macro_use]
+pub mod hostcall_macros;
+pub use lucet_runtime_macros::lucet_hostcall;
 
 #[macro_use]
 #[cfg(test)]
@@ -18,7 +21,7 @@ pub mod embed_ctx;
 pub mod instance;
 pub mod module;
 pub mod region;
-pub mod trapcode;
+pub mod sysdeps;
 pub mod val;
 pub mod vmctx;
 

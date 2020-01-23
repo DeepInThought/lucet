@@ -1,13 +1,18 @@
+# Lucet version 0.3.1
+
 [workspace]
 members = [
-  "lucet-analyze",
-  "lucet-idl",
-  "lucet-module-data",
+  "benchmarks/lucet-benchmarks",
+  "lucet-module",
+  "lucet-objdump",
   "lucet-runtime",
   "lucet-runtime/lucet-runtime-internals",
+  "lucet-runtime/lucet-runtime-macros",
   "lucet-runtime/lucet-runtime-tests",
   "lucet-spectest",
+  "lucet-validate",
   "lucet-wasi",
+  "lucet-wasi-fuzz",
   "lucet-wasi-sdk",
   "lucetc",
   "sightglass",
@@ -16,6 +21,3 @@ exclude = ["cranelift"]
 
 [profile.test]
 rpath = true
-
-[replace]
-"faerie:0.9.1" = { path = "faerie" }

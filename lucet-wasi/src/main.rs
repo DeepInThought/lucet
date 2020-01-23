@@ -1,13 +1,17 @@
+#![deny(bare_trait_objects)]
+
 #[macro_use]
 extern crate clap;
 
+use anyhow::{format_err, Error};
 use clap::Arg;
-use human_size::{Byte, Size};
-use lucet_runtime::{self, DlModule, Limits, MmapRegion, Module, Region};
-use lucet_runtime_internals::module::ModuleInternal;
-use lucet_wasi::{hostcalls, WasiCtxBuilder};
+use lucet_runtime::{self, DlModule, Limits, MmapRegion, Module, PublicKey, Region, RunResult};
+use lucet_wasi::{self, WasiCtxBuilder, __wasi_exitcode_t};
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 struct Config<'a> {
     lucet_module: &'a str,
@@ -15,13 +19,28 @@ struct Config<'a> {
     entrypoint: &'a str,
     preopen_dirs: Vec<(File, &'a str)>,
     limits: Limits,
+    timeout: Option<Duration>,
+    verify: bool,
+    pk_path: Option<PathBuf>,
+}
+
+fn parse_humansized(desc: &str) -> Result<u64, Error> {
+    use human_size::{Byte, ParsingError, Size, SpecificSize};
+    match desc.parse::<Size>() {
+        Ok(s) => {
+            let bytes: SpecificSize<Byte> = s.into();
+            Ok(bytes.value() as u64)
+        }
+        Err(ParsingError::MissingMultiple) => Ok(desc.parse::<u64>()?),
+        Err(e) => Err(e)?,
+    }
 }
 
 fn main() {
     // No-ops, but makes sure the linker doesn't throw away parts
     // of the runtime:
     lucet_runtime::lucet_internal_ensure_linked();
-    hostcalls::ensure_linked();
+    lucet_wasi::export_wasi_funcs();
 
     let matches = app_from_crate!()
         .arg(
@@ -81,10 +100,25 @@ fn main() {
                 .help("Maximum stack size (must be a multiple of 4 KiB)"),
         )
         .arg(
+            Arg::with_name("timeout").long("timeout").takes_value(true).help("Number of milliseconds the instance will be allowed to run")
+            )
+        .arg(
             Arg::with_name("guest_args")
                 .required(false)
                 .multiple(true)
                 .help("Arguments to the WASI `main` function"),
+        )
+        .arg(
+            Arg::with_name("verify")
+                .long("--signature-verify")
+                .takes_value(false)
+                .help("Verify the signature of the source file")
+        )
+        .arg(
+            Arg::with_name("pk_path")
+                .long("--signature-pk")
+                .takes_value(true)
+                .help("Path to the public key to verify the source code signature")
         )
         .get_matches();
 
@@ -111,14 +145,17 @@ fn main() {
         })
         .unwrap_or(vec![]);
 
-    let heap_memory_size = value_t!(matches, "heap_memory_size", Size)
-        .unwrap_or_else(|e| e.exit())
-        .into::<Byte>()
-        .value() as usize;
-    let heap_address_space_size = value_t!(matches, "heap_address_space_size", Size)
-        .unwrap_or_else(|e| e.exit())
-        .into::<Byte>()
-        .value() as usize;
+    let heap_memory_size = matches
+        .value_of("heap_memory_size")
+        .ok_or_else(|| format_err!("missing heap memory size"))
+        .and_then(|v| parse_humansized(v))
+        .unwrap() as usize;
+
+    let heap_address_space_size = matches
+        .value_of("heap_address_space_size")
+        .ok_or_else(|| format_err!("missing heap address space size"))
+        .and_then(|v| parse_humansized(v))
+        .unwrap() as usize;
 
     if heap_memory_size > heap_address_space_size {
         println!("`heap-address-space` must be at least as large as `max-heap-size`");
@@ -126,10 +163,15 @@ fn main() {
         std::process::exit(1);
     }
 
-    let stack_size = value_t!(matches, "stack_size", Size)
-        .unwrap_or_else(|e| e.exit())
-        .into::<Byte>()
-        .value() as usize;
+    let stack_size = matches
+        .value_of("stack_size")
+        .ok_or_else(|| format_err!("missing stack size"))
+        .and_then(|v| parse_humansized(v))
+        .unwrap() as usize;
+
+    let timeout = matches
+        .value_of("timeout")
+        .map(|t| Duration::from_millis(t.parse::<u64>().unwrap()));
 
     let limits = Limits {
         heap_memory_size,
@@ -143,23 +185,40 @@ fn main() {
         .map(|vals| vals.collect())
         .unwrap_or(vec![]);
 
+    let verify = matches.is_present("verify");
+    let pk_path = matches.value_of("pk_path").map(PathBuf::from);
+
     let config = Config {
         lucet_module,
         guest_args,
         entrypoint,
         preopen_dirs,
         limits,
+        timeout,
+        verify,
+        pk_path,
     };
 
     run(config)
 }
 
-fn run(config: Config) {
-    lucet_wasi::hostcalls::ensure_linked();
+fn run(config: Config<'_>) {
     let exitcode = {
         // doing all of this in a block makes sure everything gets dropped before exiting
-        let module = DlModule::load(&config.lucet_module).expect("module can be loaded");
-        let min_globals_size = module.globals().len() * std::mem::size_of::<u64>();
+        let pk = match (config.verify, config.pk_path) {
+            (false, _) => None,
+            (true, Some(pk_path)) => {
+                Some(PublicKey::from_file(pk_path).expect("public key can be loaded"))
+            }
+            (true, None) => panic!("signature verification requires a public key"),
+        };
+        let module = if let Some(pk) = pk {
+            DlModule::load_and_verify(&config.lucet_module, pk)
+                .expect("signed module can be loaded")
+        } else {
+            DlModule::load(&config.lucet_module).expect("module can be loaded")
+        };
+        let min_globals_size = module.initial_globals_size();
         let globals_size = ((min_globals_size + 4096 - 1) / 4096) * 4096;
 
         let region = MmapRegion::create(
@@ -175,7 +234,10 @@ fn run(config: Config) {
         let args = std::iter::once(config.lucet_module)
             .chain(config.guest_args.into_iter())
             .collect::<Vec<&str>>();
-        let mut ctx = WasiCtxBuilder::new().args(&args).inherit_env();
+        let mut ctx = WasiCtxBuilder::new()
+            .args(args.iter())
+            .inherit_stdio()
+            .inherit_env();
         for (dir, guest_path) in config.preopen_dirs {
             ctx = ctx.preopened_dir(dir, guest_path);
         }
@@ -185,14 +247,32 @@ fn run(config: Config) {
             .build()
             .expect("instance can be created");
 
-        match inst.run(config.entrypoint.as_bytes(), &[]) {
+        if let Some(timeout) = config.timeout {
+            let kill_switch = inst.kill_switch();
+            thread::spawn(move || {
+                thread::sleep(timeout);
+                // We may hit this line exactly when the guest exits, so sometimes `terminate` can
+                // fail. That's still acceptable, so just ignore the result.
+                kill_switch.terminate().ok();
+            });
+        }
+
+        match inst.run(config.entrypoint, &[]) {
             // normal termination implies 0 exit code
-            Ok(_) => 0,
+            Ok(RunResult::Returned(_)) => 0,
+            // none of the WASI hostcalls use yield yet, so this shouldn't happen
+            Ok(RunResult::Yielded(_)) => panic!("lucet-wasi unexpectedly yielded"),
             Err(lucet_runtime::Error::RuntimeTerminated(
                 lucet_runtime::TerminationDetails::Provided(any),
             )) => *any
-                .downcast_ref::<lucet_wasi::host::__wasi_exitcode_t>()
+                .downcast_ref::<__wasi_exitcode_t>()
                 .expect("termination yields an exitcode"),
+            Err(lucet_runtime::Error::RuntimeTerminated(
+                lucet_runtime::TerminationDetails::Remote,
+            )) => {
+                println!("Terminated via remote kill switch (likely a timeout)");
+                std::u32::MAX
+            }
             Err(e) => panic!("lucet-wasi runtime error: {}", e),
         }
     };

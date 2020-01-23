@@ -1,0 +1,26 @@
+[package]
+name = "lucet-objdump"
+version = "0.5.0"
+description = "Analyze object files emitted by the Lucet compiler"
+homepage = "https://github.com/fastly/lucet"
+repository = "https://github.com/fastly/lucet"
+license = "Apache-2.0 WITH LLVM-exception"
+categories = ["wasm"]
+authors = ["Lucet team <lucet@fastly.com>"]
+edition = "2018"
+
+[dependencies]
+goblin="0.0.24"
+byteorder="1.2.1"
+colored="1.8.0"
+lucet-module = { path = "../lucet-module", version = "=0.5.0" }
+
+[package.metadata.deb]
+name = "fst-lucet-objdump"
+maintainer = "Lucet team <lucet@fastly.com>"
+depends = "$auto"
+priority = "optional"
+assets = [
+    ["target/release/lucet-objdump", "/opt/fst-lucet-objdump/bin/lucet-objdump", "755"],
+    ["LICENSE", "/opt/fst-lucet-objdump/share/doc/lucet-objdump/", "644"],
+]

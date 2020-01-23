@@ -53,14 +53,13 @@ macro_rules! init_and_swap {
         unsafe {
             let child = Box::into_raw(Box::new(ContextHandle::create_and_init(
                 &mut *$stack,
-                parent_regs.as_mut().unwrap(),
-                $fn as *const extern "C" fn(),
+                $fn as usize,
                 &[$( $args ),*],
             ).unwrap()));
 
             child_regs = child;
 
-            Context::swap(parent_regs.as_mut().unwrap(), child_regs.as_ref().unwrap());
+            Context::swap(parent_regs.as_mut().unwrap(), child_regs.as_mut().unwrap());
         }
     }
 }
@@ -110,7 +109,7 @@ fn call_child_twice() {
         arg1_val = 10;
 
         unsafe {
-            Context::swap(parent_regs.as_mut().unwrap(), child_regs.as_ref().unwrap());
+            Context::swap(parent_regs.as_mut().unwrap(), child_regs.as_mut().unwrap());
         }
 
         assert_eq!(

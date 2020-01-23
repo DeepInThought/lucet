@@ -7,7 +7,7 @@ macro_rules! alloc_tests {
         use $crate::alloc::Limits;
         use $crate::context::{Context, ContextHandle};
         use $crate::instance::InstanceInternal;
-        use $crate::module::{HeapSpec, MockModuleBuilder};
+        use $crate::module::{GlobalValue, HeapSpec, MockModuleBuilder};
         use $crate::region::Region;
         use $crate::val::Val;
 
@@ -348,15 +348,22 @@ macro_rules! alloc_tests {
                 assert_eq!(stack[LIMITS_STACK_SIZE - 1], 0xFF);
 
                 let globals = unsafe { inst.alloc_mut().globals_mut() };
-                assert_eq!(globals.len(), LIMITS_GLOBALS_SIZE / 8);
+                assert_eq!(
+                    globals.len(),
+                    LIMITS_GLOBALS_SIZE / std::mem::size_of::<GlobalValue>()
+                );
 
-                assert_eq!(globals[0], 0);
-                globals[0] = 0xFF;
-                assert_eq!(globals[0], 0xFF);
+                unsafe {
+                    assert_eq!(globals[0].i_64, 0);
+                    globals[0].i_64 = 0xFF;
+                    assert_eq!(globals[0].i_64, 0xFF);
+                }
 
-                assert_eq!(globals[globals.len() - 1], 0);
-                globals[globals.len() - 1] = 0xFF;
-                assert_eq!(globals[globals.len() - 1], 0xFF);
+                unsafe {
+                    assert_eq!(globals[globals.len() - 1].i_64, 0);
+                    globals[globals.len() - 1].i_64 = 0xFF;
+                    assert_eq!(globals[globals.len() - 1].i_64, 0xFF);
+                }
 
                 let sigstack = unsafe { inst.alloc_mut().sigstack_mut() };
                 assert_eq!(sigstack.len(), libc::SIGSTKSZ);
@@ -377,10 +384,55 @@ macro_rules! alloc_tests {
             peek_n_poke(&region);
         }
 
-        /// This test shows that the reset method clears the heap and restores it to the spec
-        /// initial size.
+        /// This test shows that the reset method clears the heap and resets its protections.
         #[test]
         fn alloc_reset() {
+            let region = TestRegion::create(1, &LIMITS).expect("region created");
+            let module = MockModuleBuilder::new()
+                .with_heap_spec(THREE_PAGE_MAX_HEAP)
+                .build();
+            let mut inst = region
+                .new_instance(module.clone())
+                .expect("new_instance succeeds");
+
+            let heap_len = inst.alloc().heap_len();
+            assert_eq!(heap_len, THREEPAGE_INITIAL_SIZE as usize);
+
+            let heap = unsafe { inst.alloc_mut().heap_mut() };
+
+            assert_eq!(heap[0], 0);
+            heap[0] = 0xFF;
+            assert_eq!(heap[0], 0xFF);
+
+            assert_eq!(heap[heap_len - 1], 0);
+            heap[heap_len - 1] = 0xFF;
+            assert_eq!(heap[heap_len - 1], 0xFF);
+
+            // Making a new mock module here because the borrow checker doesn't like referencing
+            // `inst.module` while `inst.alloc()` is borrowed mutably. The `Instance` tests don't have
+            // this weirdness
+            inst.alloc_mut()
+                .reset_heap(module.as_ref())
+                .expect("reset succeeds");
+
+            let reset_heap_len = inst.alloc().heap_len();
+            assert_eq!(reset_heap_len, THREEPAGE_INITIAL_SIZE as usize);
+
+            let heap = unsafe { inst.alloc_mut().heap_mut() };
+
+            assert_eq!(heap[0], 0);
+            heap[0] = 0xFF;
+            assert_eq!(heap[0], 0xFF);
+
+            assert_eq!(heap[reset_heap_len - 1], 0);
+            heap[reset_heap_len - 1] = 0xFF;
+            assert_eq!(heap[reset_heap_len - 1], 0xFF);
+        }
+
+        /// This test shows that the reset method clears the heap and restores it to the spec
+        /// initial size after growing the heap.
+        #[test]
+        fn alloc_grow_reset() {
             let region = TestRegion::create(1, &LIMITS).expect("region created");
             let module = MockModuleBuilder::new()
                 .with_heap_spec(THREE_PAGE_MAX_HEAP)
@@ -550,14 +602,13 @@ macro_rules! alloc_tests {
             let mut parent = ContextHandle::new();
             unsafe {
                 let heap_ptr = inst.alloc_mut().heap_mut().as_ptr() as *mut c_void;
-                let child = ContextHandle::create_and_init(
+                let mut child = ContextHandle::create_and_init(
                     inst.alloc_mut().stack_u64_mut(),
-                    &mut parent,
-                    heap_touching_child as *const extern "C" fn(),
+                    heap_touching_child as usize,
                     &[Val::CPtr(heap_ptr)],
                 )
                 .expect("context init succeeds");
-                Context::swap(&mut parent, &child);
+                Context::swap(&mut parent, &mut child);
                 assert_eq!(inst.alloc().heap()[0], 123);
                 assert_eq!(inst.alloc().heap()[4095], 45);
             }
@@ -574,7 +625,15 @@ macro_rules! alloc_tests {
                     std::slice::from_raw_parts_mut(heap, CONTEXT_TEST_INITIAL_SIZE as usize / 8)
                 };
                 let mut onthestack = [0u8; STACK_PATTERN_LENGTH];
+                // While not used, this array is load-bearing! A function that executes after the
+                // guest completes, `instance_kill_state_exit_guest_region`, may end up using
+                // sufficient stack space to trample over values in this function's call frame.
+                //
+                // Padding it out with a duplicate pattern makes enough space for `onthestack` to
+                // not be clobbered.
+                let mut ignored = [0u8; STACK_PATTERN_LENGTH];
                 for i in 0..STACK_PATTERN_LENGTH {
+                    ignored[i] = (i % 256) as u8;
                     onthestack[i] = (i % 256) as u8;
                 }
                 heap[0] = onthestack.as_ptr() as u64;
@@ -592,14 +651,13 @@ macro_rules! alloc_tests {
             let mut parent = ContextHandle::new();
             unsafe {
                 let heap_ptr = inst.alloc_mut().heap_mut().as_ptr() as *mut c_void;
-                let child = ContextHandle::create_and_init(
+                let mut child = ContextHandle::create_and_init(
                     inst.alloc_mut().stack_u64_mut(),
-                    &mut parent,
-                    stack_pattern_child as *const extern "C" fn(),
+                    stack_pattern_child as usize,
                     &[Val::CPtr(heap_ptr)],
                 )
                 .expect("context init succeeds");
-                Context::swap(&mut parent, &child);
+                Context::swap(&mut parent, &mut child);
 
                 let stack_pattern = inst.alloc().heap_u64()[0] as usize;
                 assert!(stack_pattern > inst.alloc().slot().stack as usize);
@@ -612,6 +670,16 @@ macro_rules! alloc_tests {
                     assert_eq!(stack_pattern[i], (i % 256) as u8);
                 }
             }
+        }
+
+        #[test]
+        fn drop_region_first() {
+            let region = TestRegion::create(1, &Limits::default()).expect("region can be created");
+            let inst = region
+                .new_instance(MockModuleBuilder::new().build())
+                .expect("new_instance succeeds");
+            drop(region);
+            drop(inst);
         }
     };
 }

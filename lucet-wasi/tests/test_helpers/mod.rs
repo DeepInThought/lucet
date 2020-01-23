@@ -1,10 +1,8 @@
-use failure::{bail, Error};
-use lucet_runtime::{DlModule, Module};
-use lucet_runtime::{Limits, MmapRegion, Region};
-use lucet_wasi::host::__wasi_exitcode_t;
-use lucet_wasi::{WasiCtx, WasiCtxBuilder};
-use lucet_wasi_sdk::Link;
-use lucetc::{Bindings, Lucetc};
+use anyhow::{bail, Error};
+use lucet_runtime::{DlModule, Limits, MmapRegion, Module, Region};
+use lucet_wasi::{self, WasiCtx, WasiCtxBuilder, __wasi_exitcode_t};
+use lucet_wasi_sdk::{CompileOpts, Link};
+use lucetc::{Lucetc, LucetcOpts};
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -32,21 +30,42 @@ pub fn guest_file<P: AsRef<Path>>(path: P) -> PathBuf {
     p
 }
 
-pub fn wasi_test<P: AsRef<Path>>(c_file: P) -> Result<Arc<dyn Module>, Error> {
+pub fn wasi_test<P: AsRef<Path>>(file: P) -> Result<Arc<dyn Module>, Error> {
     let workdir = TempDir::new().expect("create working directory");
 
-    let wasm_build = Link::new(&[c_file])
-        .cflag("-Wall")
-        .cflag("-Werror")
-        .print_output(true);
+    let wasm_path = match file.as_ref().extension().and_then(|x| x.to_str()) {
+        Some("c") => {
+            // some tests are .c, and must be compiled/linked to .wasm we can run
+            let wasm_build = Link::new(&[file])
+                .with_cflag("-Wall")
+                .with_cflag("-Werror")
+                .with_print_output(true);
 
-    let wasm_file = workdir.path().join("out.wasm");
+            let wasm_file = workdir.path().join("out.wasm");
+            wasm_build.link(wasm_file.clone())?;
 
-    wasm_build.link(wasm_file.clone())?;
+            wasm_file
+        }
+        Some("wasm") | Some("wat") => {
+            // others are just wasm we can run directly
+            file.as_ref().to_owned()
+        }
+        Some(ext) => {
+            panic!("unknown test file extension: .{}", ext);
+        }
+        None => {
+            panic!("unknown test file, has no extension");
+        }
+    };
 
-    let bindings = Bindings::from_file(Path::new(LUCET_WASI_ROOT).join("bindings.json"))?;
+    wasi_load(&workdir, wasm_path)
+}
 
-    let native_build = Lucetc::new(wasm_file)?.bindings(bindings)?;
+pub fn wasi_load<P: AsRef<Path>>(
+    workdir: &TempDir,
+    wasm_file: P,
+) -> Result<Arc<dyn Module>, Error> {
+    let native_build = Lucetc::new(wasm_file).with_bindings(lucet_wasi::bindings());
 
     let so_file = workdir.path().join("out.so");
 
@@ -66,7 +85,7 @@ pub fn run<P: AsRef<Path>>(path: P, ctx: WasiCtx) -> Result<__wasi_exitcode_t, E
         .with_embed_ctx(ctx)
         .build()?;
 
-    match inst.run(b"_start", &[]) {
+    match inst.run("_start", &[]) {
         // normal termination implies 0 exit code
         Ok(_) => Ok(0),
         Err(lucet_runtime::Error::RuntimeTerminated(
@@ -84,7 +103,7 @@ pub fn run_with_stdout<P: AsRef<Path>>(
 ) -> Result<(__wasi_exitcode_t, String), Error> {
     let (pipe_out, pipe_in) = nix::unistd::pipe()?;
 
-    let ctx = unsafe { ctx.raw_fd(1, pipe_in) }.build()?;
+    let ctx = ctx.stdout(unsafe { File::from_raw_fd(pipe_in) }).build()?;
 
     let exitcode = run(path, ctx)?;
 
@@ -96,6 +115,21 @@ pub fn run_with_stdout<P: AsRef<Path>>(
     Ok((exitcode, stdout))
 }
 
+pub fn run_with_null_stdin<P: AsRef<Path>>(
+    path: P,
+    ctx: WasiCtxBuilder,
+) -> Result<__wasi_exitcode_t, Error> {
+    let (pipe_out, pipe_in) = nix::unistd::pipe()?;
+
+    let ctx = ctx.stdin(unsafe { File::from_raw_fd(pipe_out) }).build()?;
+
+    let exitcode = run(path, ctx)?;
+
+    nix::unistd::close(pipe_in)?;
+
+    Ok(exitcode)
+}
+
 /// Call this if you're having trouble with `__wasi_*` symbols not being exported.
 ///
 /// This is pretty hackish; we will hopefully be able to avoid this altogether once [this
@@ -103,5 +137,5 @@ pub fn run_with_stdout<P: AsRef<Path>>(
 #[no_mangle]
 #[doc(hidden)]
 pub extern "C" fn lucet_wasi_tests_internal_ensure_linked() {
-    lucet_wasi::hostcalls::ensure_linked();
+    lucet_wasi::export_wasi_funcs();
 }

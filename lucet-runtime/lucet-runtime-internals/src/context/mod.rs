@@ -3,14 +3,14 @@
 #[cfg(test)]
 mod tests;
 
+use crate::instance::Instance;
 use crate::val::{val_to_reg, val_to_stack, RegVal, UntypedRetVal, Val};
-use failure::Fail;
 use nix;
 use nix::sys::signal;
 use std::arch::x86_64::{__m128, _mm_setzero_ps};
-use std::mem;
 use std::ptr::NonNull;
-use xfailure::xbail;
+use std::{mem, ptr};
+use thiserror::Error;
 
 /// Callee-saved general-purpose registers in the AMD64 ABI.
 ///
@@ -25,15 +25,16 @@ use xfailure::xbail;
 /// <https://doc.rust-lang.org/nomicon/other-reprs.html#reprpacked>. Since the members are all
 /// `u64`, this should be fine?
 #[repr(C)]
-struct GpRegs {
+pub(crate) struct GpRegs {
     rbx: u64,
-    rsp: u64,
+    pub(crate) rsp: u64,
     rbp: u64,
-    rdi: u64,
+    pub(crate) rdi: u64,
     r12: u64,
     r13: u64,
     r14: u64,
     r15: u64,
+    pub(crate) rsi: u64,
 }
 
 impl GpRegs {
@@ -47,6 +48,7 @@ impl GpRegs {
             r13: 0,
             r14: 0,
             r15: 0,
+            rsi: 0,
         }
     }
 }
@@ -94,6 +96,9 @@ impl FpRegs {
 /// Everything we need to make a context switch: a signal mask, and the registers and return values
 /// that are manipulated directly by assembly code.
 ///
+/// A context also tracks which other context to swap back to if a child context's entrypoint function
+/// returns, and can optionally contain a callback function to be run just before that swap occurs.
+///
 /// # Layout
 ///
 /// The `repr(C)` and order of fields in this struct are very important, as the assembly code reads
@@ -110,10 +115,14 @@ impl FpRegs {
 /// that pointer becomes invalid, and the behavior of returning from that context becomes undefined.
 #[repr(C, align(64))]
 pub struct Context {
-    gpr: GpRegs,
+    pub(crate) gpr: GpRegs,
     fpr: FpRegs,
     retvals_gp: [u64; 2],
     retval_fp: __m128,
+    parent_ctx: *mut Context,
+    // TODO ACF 2019-10-23: make Instance into a generic parameter?
+    backstop_callback: *const unsafe extern "C" fn(*mut Instance),
+    backstop_data: *mut Instance,
     sigset: signal::SigSet,
 }
 
@@ -125,6 +134,9 @@ impl Context {
             fpr: FpRegs::new(),
             retvals_gp: [0; 2],
             retval_fp: unsafe { _mm_setzero_ps() },
+            parent_ctx: ptr::null_mut(),
+            backstop_callback: Context::default_backstop_callback as *const _,
+            backstop_data: ptr::null_mut(),
             sigset: signal::SigSet::empty(),
         }
     }
@@ -192,13 +204,55 @@ impl ContextHandle {
 
     pub fn create_and_init(
         stack: &mut [u64],
-        parent: &mut ContextHandle,
-        fptr: *const extern "C" fn(),
+        fptr: usize,
         args: &[Val],
     ) -> Result<ContextHandle, Error> {
         let mut child = ContextHandle::new();
-        Context::init(stack, parent, &mut child, fptr, args)?;
+        Context::init(stack, &mut child, fptr, args)?;
         Ok(child)
+    }
+}
+
+struct CallStackBuilder<'a> {
+    offset: usize,
+    stack: &'a mut [u64],
+}
+
+impl<'a> CallStackBuilder<'a> {
+    pub fn new(stack: &'a mut [u64]) -> Self {
+        CallStackBuilder { offset: 0, stack }
+    }
+
+    fn push(&mut self, val: u64) {
+        self.offset += 1;
+        self.stack[self.stack.len() - self.offset] = val;
+    }
+
+    /// Stores `args` onto the stack such that when a return address is written after, the
+    /// complete unit will be 16-byte aligned, as the x86_64 ABI requires.
+    ///
+    /// That is to say, `args` will be padded such that the current top of stack is 8-byte
+    /// aligned.
+    fn store_args(&mut self, args: &[u64]) {
+        let items_end = args.len() + self.offset;
+
+        if items_end % 2 == 1 {
+            // we need to add one entry just before the arguments so that the arguments start on an
+            // aligned address.
+            self.push(0);
+        }
+
+        for arg in args.iter().rev() {
+            self.push(*arg);
+        }
+    }
+
+    fn offset(&self) -> usize {
+        self.offset
+    }
+
+    fn into_inner(self) -> (&'a mut [u64], usize) {
+        (self.stack, self.offset)
     }
 }
 
@@ -206,10 +260,6 @@ impl Context {
     /// Initialize a new child context.
     ///
     /// - `stack`: The stack for the child; *must be 16-byte aligned*.
-    ///
-    /// - `parent`: The context that the child will return to. Since `swap` initializes the fields
-    /// in its `from` argument, this will typically be an empty context from `ContextHandle::zero()`
-    /// that will later be passed to `swap`.
     ///
     /// - `child`: The context for the child. The fields of this structure will be overwritten by
     /// `init`.
@@ -245,13 +295,11 @@ impl Context {
     /// // allocating an even number of `u64`s seems to reliably yield
     /// // properly aligned stacks, but TODO do better
     /// let mut stack = vec![0u64; 1024].into_boxed_slice();
-    /// let mut parent = Context::new();
     /// let mut child = Context::new();
     /// let res = Context::init(
     ///     &mut *stack,
-    ///     &mut parent,
     ///     &mut child,
-    ///     entrypoint as *const extern "C" fn(),
+    ///     entrypoint as usize,
     ///     &[Val::U64(120), Val::F32(3.14)],
     /// );
     /// assert!(res.is_ok());
@@ -270,30 +318,92 @@ impl Context {
     /// // allocating an even number of `u64`s seems to reliably yield
     /// // properly aligned stacks, but TODO do better
     /// let mut stack = vec![0u64; 1024].into_boxed_slice();
-    /// let mut parent = ContextHandle::new();
     /// let mut child = Context::new();
     /// let res = Context::init(
     ///     &mut *stack,
-    ///     &mut parent,
     ///     &mut child,
-    ///     entrypoint as *const extern "C" fn(),
+    ///     entrypoint as usize,
     ///     &[Val::U64(120), Val::F32(3.14)],
     /// );
     /// assert!(res.is_ok());
     /// ```
+    ///
+    /// # Implementation details
+    ///
+    /// This prepares a stack for the child context structured as follows, assuming an 0x1000 byte
+    /// stack:
+    /// ```text
+    /// 0x1000: +-------------------------+
+    /// 0x0ff8: | NULL                    | // Null added if necessary for alignment.
+    /// 0x0ff0: | spilled_arg_1           | // Guest arguments follow.
+    /// 0x0fe8: | spilled_arg_2           |
+    /// 0x0fe0: ~ spilled_arg_3           ~ // The three arguments here are just for show.
+    /// 0x0fd8: | lucet_context_backstop  | <-- This forms an ABI-matching call frame for fptr.
+    /// 0x0fd0: | fptr                    | <-- The actual guest code we want to run.
+    /// 0x0fc8: | lucet_context_bootstrap | <-- The guest stack pointer starts here.
+    /// 0x0fc0: |                         |
+    /// 0x0XXX: ~                         ~ // Rest of the stack needs no preparation.
+    /// 0x0000: |                         |
+    ///         +-------------------------+
+    /// ```
+    ///
+    /// This packing of data on the stack is interwoven with noteworthy constraints on what the
+    /// backstop may do:
+    /// * The backstop must not return on the guest stack.
+    ///   - The next value will be a spilled argument or NULL. Neither are an intended address.
+    /// * The backstop cannot have ABI-conforming spilled arguments.
+    ///   - No code runs between `fptr` and `lucet_context_backstop`, so nothing exists to
+    ///     clean up `fptr`'s arguments. `lucet_context_backstop` would have to adjust the
+    ///     stack pointer by a variable amount, and it does not, so `rsp` will continue to
+    ///     point to guest arguments.
+    ///   - This is why bootstrap recieves arguments via rbp, pointing elsewhere on the stack.
+    ///
+    /// The bootstrap function must be careful, but is less constrained since it can clean up
+    /// and prepare a context for `fptr`.
     pub fn init(
         stack: &mut [u64],
-        parent: &mut Context,
         child: &mut Context,
-        fptr: *const extern "C" fn(),
+        fptr: usize,
+        args: &[Val],
+    ) -> Result<(), Error> {
+        Context::init_with_callback(
+            stack,
+            child,
+            Context::default_backstop_callback,
+            ptr::null_mut(),
+            fptr,
+            args,
+        )
+    }
+
+    /// The default backstop callback does nothing, and is just a marker.
+    extern "C" fn default_backstop_callback(_: *mut Instance) {}
+
+    /// Similar to `Context::init()`, but allows setting a callback function to be run when the
+    /// guest entrypoint returns.
+    ///
+    /// After the entrypoint function returns, but before swapping back to the parent context,
+    /// `backstop_callback` will be run with the single argument `backstop_data`.
+    pub fn init_with_callback(
+        stack: &mut [u64],
+        child: &mut Context,
+        backstop_callback: unsafe extern "C" fn(*mut Instance),
+        backstop_data: *mut Instance,
+        fptr: usize,
         args: &[Val],
     ) -> Result<(), Error> {
         if !stack_is_aligned(stack) {
-            xbail!(Error::UnalignedStack);
+            return Err(Error::UnalignedStack);
+        }
+
+        if backstop_callback != Context::default_backstop_callback {
+            child.backstop_callback = backstop_callback as *const _;
+            child.backstop_data = backstop_data;
         }
 
         let mut gp_args_ix = 0;
         let mut fp_args_ix = 0;
+        let mut gp_regs_values = [0u64; 6];
 
         let mut spilled_args = vec![];
 
@@ -301,15 +411,15 @@ impl Context {
             match val_to_reg(arg) {
                 RegVal::GpReg(v) => {
                     if gp_args_ix >= 6 {
-                        spilled_args.push(arg);
+                        spilled_args.push(val_to_stack(arg));
                     } else {
-                        child.bootstrap_gp_ix_arg(gp_args_ix, v);
+                        gp_regs_values[gp_args_ix] = v;
                         gp_args_ix += 1;
                     }
                 }
                 RegVal::FpReg(v) => {
                     if fp_args_ix >= 8 {
-                        spilled_args.push(arg);
+                        spilled_args.push(val_to_stack(arg));
                     } else {
                         child.bootstrap_fp_ix_arg(fp_args_ix, v);
                         fp_args_ix += 1;
@@ -318,61 +428,57 @@ impl Context {
             }
         }
 
-        // the top of the stack; should not be used as an index, always subtracted from
-        let sp = stack.len();
+        // set up an initial call stack for guests to bootstrap into and execute
+        let mut stack_builder = CallStackBuilder::new(stack);
 
-        let stack_start = 3 // the bootstrap ret addr, then guest func ret addr, then the backstop ret addr
-        + spilled_args.len() // then any args to guest func that don't fit in registers
-        + spilled_args.len() % 2 // padding to keep the stack 16-byte aligned when we spill an odd number of spilled arguments
-        + 4; // then the backstop args and terminator
+        // we actually don't want to put an explicit pointer to these arguments anywhere. we'll
+        // line up the rest of the stack such that these are in argument position when we jump to
+        // `fptr`.
+        stack_builder.store_args(spilled_args.as_slice());
 
-        // stack-saved arguments start 3 below the top of the stack
-        // (TODO: a diagram would be great here)
-        let mut stack_args_ix = 3;
+        // the stack must be aligned in the environment we'll execute `fptr` from - this is an ABI
+        // requirement and can cause segfaults if not upheld.
+        assert_eq!(
+            stack_builder.offset() % 2,
+            0,
+            "incorrect alignment for guest call frame"
+        );
 
-        // If there are more additional args to the guest function than available registers, they
-        // have to be pushed on the stack underneath the return address.
-        for arg in spilled_args {
-            let v = val_to_stack(arg);
-            stack[sp + stack_args_ix - stack_start] = v;
-            stack_args_ix += 1;
+        // we execute the guest code via returns, so we make a "call stack" of routines like:
+        // -> lucet_context_backstop()
+        //    -> fptr()
+        //       -> lucet_context_bootstrap()
+        //
+        // with each address the start of the named function, so when the inner function
+        // completes it returns to begin the next function up.
+        stack_builder.push(lucet_context_backstop as u64);
+        stack_builder.push(fptr as u64);
+
+        // add all general purpose arguments for the guest to be bootstrapped
+        for arg in gp_regs_values.iter() {
+            stack_builder.push(*arg);
         }
 
-        // Prepare the stack for a swap context that lands in the bootstrap function swap will ret
-        // into the bootstrap function
-        stack[sp + 0 - stack_start] = lucet_context_bootstrap as u64;
+        stack_builder.push(lucet_context_bootstrap as u64);
 
-        // The bootstrap function returns into the guest function, fptr
-        stack[sp + 1 - stack_start] = fptr as u64;
-
-        // the guest function returns into lucet_context_backstop.
-        stack[sp + 2 - stack_start] = lucet_context_backstop as u64;
-
-        // if fptr ever returns, it returns to the backstop func. backstop needs two arguments in
-        // its frame - first the context we are switching *out of* (which is also the one we are
-        // creating right now) and the ctx we switch back into. Note *parent might not be a valid
-        // ctx now, but it should be when this ctx is started.
-        stack[sp - 4] = child as *mut Context as u64;
-        stack[sp - 3] = parent as *mut Context as u64;
-        // Terminate the call chain.
-        stack[sp - 2] = 0;
-        stack[sp - 1] = 0;
+        let (stack, stack_start) = stack_builder.into_inner();
 
         // RSP, RBP, and sigset still remain to be initialized.
-        // Stack pointer: this has the return address of the first function to be run on the swap.
-        child.gpr.rsp = &mut stack[sp - stack_start] as *mut u64 as u64;
-        // Frame pointer: this is only used by the backstop code. It uses it to locate the ctx and
-        // parent arguments set above.
-        child.gpr.rbp = &mut stack[sp - 2] as *mut u64 as u64;
+        // Stack pointer: this points to the return address that will be used by `swap`, in place
+        // of the original (eg, in the host) return address. The return address this points to is
+        // the address of the first function to run on `swap`: `lucet_context_bootstrap`.
+        child.gpr.rsp = &mut stack[stack.len() - stack_start] as *mut u64 as u64;
 
-        // Read the sigprocmask to be restored if we ever need to jump out of a signal handler. If
-        // this isn't possible, die.
-        signal::sigprocmask(
+        child.gpr.rbp = child as *const Context as u64;
+
+        // Read the mask to be restored if we ever need to jump out of a signal handler. If this
+        // isn't possible, die.
+        signal::pthread_sigmask(
             signal::SigmaskHow::SIG_SETMASK,
             None,
             Some(&mut child.sigset),
         )
-        .expect("sigprocmask could not be retrieved");
+        .expect("pthread_sigmask could not be retrieved");
 
         Ok(())
     }
@@ -386,12 +492,16 @@ impl Context {
     /// pointer is then replaced by the value saved in `to.gpr.rsp`, so when `swap` returns, it will
     /// return to the pointer saved in `to`'s stack.
     ///
-    /// If `to` was freshly initialized by passing it as the child to `init`, `swap` will return to
-    /// the function that bootstraps arguments and then calls the entrypoint that was passed to
-    /// `init`.
+    /// If `to` was freshly initialized by passing it as the `child` argument to `init`, `swap` will
+    /// return to the function that bootstraps arguments and then calls the entrypoint that was
+    /// passed to `init`.
     ///
     /// If `to` was previously passed as the `from` argument to another call to `swap`, the program
     /// will return as if from that _first_ call to `swap`.
+    ///
+    /// The address of `from` will be saved as `to.parent_ctx`. If `to` was initialized by `init`,
+    /// it will swap back to the `from` context when the entrypoint function returns via
+    /// `lucet_context_backstop`.
     ///
     /// # Safety
     ///
@@ -403,12 +513,16 @@ impl Context {
     /// of the function passed to `init`, or be unaltered from when they were previously written by
     /// `swap`.
     ///
+    /// If `to` was initialized by `init`, the `from` context must not be moved, dropped, or
+    /// otherwise invalidated while in the `to` context unless `to`'s entrypoint function never
+    /// returns.
+    ///
     /// If `from` is never returned to, `swap`ped to, or `set` to, resources could leak due to
     /// implicit `drop`s never being called:
     ///
     /// ```no_run
     /// # use lucet_runtime_internals::context::Context;
-    /// fn f(x: Box<u64>, child: &Context) {
+    /// fn f(x: Box<u64>, child: &mut Context) {
     ///     let mut xs = vec![187; 410757864530];
     ///     xs[0] += *x;
     ///
@@ -435,17 +549,17 @@ impl Context {
     /// let mut child = Context::new();
     /// Context::init(
     ///     &mut stack,
-    ///     &mut parent,
     ///     &mut child,
-    ///     entrypoint as *const extern "C" fn(),
+    ///     entrypoint as usize,
     ///     &[],
     /// ).unwrap();
     ///
-    /// unsafe { Context::swap(&mut parent, &child); }
+    /// unsafe { Context::swap(&mut parent, &mut child); }
     /// ```
     #[inline]
-    pub unsafe fn swap(from: &mut Context, to: &Context) {
-        lucet_context_swap(from as *mut Context, to as *const Context);
+    pub unsafe fn swap(from: &mut Context, to: &mut Context) {
+        to.parent_ctx = from;
+        lucet_context_swap(from as *mut _, to as *mut _);
     }
 
     /// Swap to another context without saving the current context.
@@ -476,13 +590,14 @@ impl Context {
     ///
     /// ## Returning
     ///
-    /// If `to` is a context freshly initialized by `init`, at least one of the following must be
-    /// true, otherwise the program will return to a context with uninitialized registers:
+    /// If `to` is a context freshly initialized by `init` (as opposed to a context populated only
+    /// by `swap`, such as a host context), at least one of the following must be true, otherwise
+    /// the program will return to a context with uninitialized registers:
     ///
     /// - The `fptr` argument to `init` is a function that never returns
     ///
-    /// - The `parent` argument to `init` was passed as the `from` argument to `swap` before this
-    /// call to `set`
+    /// - A valid context must have been passed as the `from` argument to `swap` when entering the
+    ///   current context before this call to `set`
     ///
     /// ## Resource leaks
     ///
@@ -515,7 +630,7 @@ impl Context {
     /// `!` as a type like that is currently experimental.
     #[inline]
     pub unsafe fn set_from_signal(to: &Context) -> Result<(), nix::Error> {
-        signal::sigprocmask(signal::SigmaskHow::SIG_SETMASK, Some(&to.sigset), None)?;
+        signal::pthread_sigmask(signal::SigmaskHow::SIG_SETMASK, Some(&to.sigset), None)?;
         Context::set(to)
     }
 
@@ -551,31 +666,6 @@ impl Context {
         UntypedRetVal::new(gp, fp)
     }
 
-    /// Put one of the first 6 general-purpose arguments into a `Context` register.
-    ///
-    /// Although these registers are callee-saved registers rather than argument registers, they get
-    /// moved into argument registers by `lucet_context_bootstrap`.
-    ///
-    /// - `ix`: ABI general-purpose argument number
-    /// - `arg`: argument value
-    fn bootstrap_gp_ix_arg(&mut self, ix: usize, arg: u64) {
-        match ix {
-            // rdi lives across bootstrap
-            0 => self.gpr.rdi = arg,
-            // bootstraps into rsi
-            1 => self.gpr.r12 = arg,
-            // bootstraps into rdx
-            2 => self.gpr.r13 = arg,
-            // bootstraps into rcx
-            3 => self.gpr.r14 = arg,
-            // bootstraps into r8
-            4 => self.gpr.r15 = arg,
-            // bootstraps into r9
-            5 => self.gpr.rbx = arg,
-            _ => panic!("unexpected gp register index {}", ix),
-        }
-    }
-
     /// Put one of the first 8 floating-point arguments into a `Context` register.
     ///
     /// - `ix`: ABI floating-point argument number
@@ -596,10 +686,10 @@ impl Context {
 }
 
 /// Errors that may arise when working with contexts.
-#[derive(Debug, Fail)]
+#[derive(Debug, Error)]
 pub enum Error {
     /// Raised when the bottom of the stack provided to `Context::init` is not 16-byte aligned
-    #[fail(display = "context initialized with unaligned stack")]
+    #[error("context initialized with unaligned stack")]
     UnalignedStack,
 }
 
@@ -626,10 +716,16 @@ extern "C" {
     fn lucet_context_backstop();
 
     /// Saves the current context and performs the context switch. Implemented in assembly.
-    fn lucet_context_swap(from: *mut Context, to: *const Context);
+    fn lucet_context_swap(from: *mut Context, to: *mut Context);
 
     /// Performs the context switch; implemented in assembly.
     ///
     /// Never returns because the current context is discarded.
     fn lucet_context_set(to: *const Context) -> !;
+
+    /// Enables termination for the instance, after performing a context switch.
+    ///
+    /// Takes the guest return address as an argument as a consequence of implementation details,
+    /// see `Instance::swap_and_return` for more.
+    pub(crate) fn lucet_context_activate();
 }
